@@ -1,25 +1,34 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Sep  9 11:51:08 2025
+
+@author: jarip
+"""
+
 #!/usr/bin/env python3
 """
-merge_fantacalcio_batch.py
+merge_fantarounds_auto_roster.py
 
-Batch-merge all rounds of Fantacalcio votes:
-- Scans a folder for per-round files named like:
-    VotiExcelUfficiali202501.xlsx
-    Voti_Fantacalcio_Stagione_*_Giornata202501.xlsx
-  (Round code is 6 digits: YYYYRR, e.g., 202501 → season=2025, round=1)
+Batch-merge all rounds of Fantacalcio votes with automatic roster selection:
+
+- Roster files (LEFT) are discovered by pattern:
+    fanta-26_YYYYRR.xlsx
+  If only one exists, it's used for all rounds.
+  If multiple exist, for each round YYYYRR we pick the roster with the
+  greatest code <= YYYYRR (fallback to the smallest code if none <=).
+
+- Round files (RIGHT/EXTRA) are discovered by:
+    VotiExcelUfficialiYYYYRR.xlsx
+    Voti_Fantacalcio_Stagione_*_GiornataYYYYRR.xlsx
 
 - Robust name matching:
   * Normalizes names (case/accents/punct/initials)
   * Disambiguates ambiguous surnames by first initial only when needed
     (builds '__merge_key'; dedups by key to avoid cross-joins)
 
-- Merges LEFT (roster) + RIGHT (main votes) + EXTRA workbook (multi-sheets; columns suffixed per sheet)
-
-- Outputs one Excel with:
-  * merged_all
-  * round_stats
-  * match_methods_by_round
-  * coverage_by_round (if extra sheets present)
+- Outputs:
+  * fantacalcio_merged_all_rounds.xlsx  (full, multiple sheets)
+  * fantacalcio_merged_all_rounds_reduced.xlsx  (slim columns)
 
 Requirements:
   pip install pandas openpyxl xlsxwriter
@@ -39,18 +48,16 @@ import sys
 # HARD-CODED DEFAULTS (edit here)
 # ===============================
 DEFAULTS = {
-    # Your roster / player list
+    # BATCH MODE: main folder with inputs and outputs
+    "votes_dir": Path(r"C:\virtual\projects\fanta\data"),
+
+    # Single-round (legacy) inputs — used only when --votes-dir is NOT provided
     "left": Path(r"C:\virtual\projects\fanta\data\fanta-26_202501.xlsx"),
     "left_sheet": None,
-
-    # Single-round (legacy) inputs — used only if --votes-dir is NOT provided
     "right": Path(r"C:\virtual\projects\fanta\data\VotiExcelUfficiali202501.xlsx"),
     "right_sheet": None,
     "extra_workbook": Path(r"C:\virtual\projects\fanta\data\Voti_Fantacalcio_Stagione_2025_26_Giornata202501.xlsx"),
     "extra_sheets": None,  # or e.g. ["Voti Redazione","Voti Live","Voti Statistici"]
-
-    # BATCH MODE: folder to scan for all rounds
-    "votes_dir": Path(r"C:\virtual\projects\fanta\data"),
 
     # How to join extra sheets:
     #   "left"  -> enrich only existing players (default; avoids 'extra_only' rows)
@@ -59,18 +66,18 @@ DEFAULTS = {
     # If 'outer' join is used, you can still drop rows that are extra-only:
     "drop_extra_only": True,
 
-    # Output file
+    # Output files (full + reduced)
     "output": Path(r"C:\virtual\projects\fanta\data\fantacalcio_merged_all_rounds.xlsx"),
     "output_reduced": Path(r"C:\virtual\projects\fanta\data\fantacalcio_merged_all_rounds_reduced.xlsx"),
     # Which columns to keep in the reduced file (only those that exist will be written)
     "reduced_keep_cols": [
-    "season","round","round_code",
+        "season","round","round_code",
     "giocatore",
-    "match_flag","match_method","similarity","_merge",
+    "match_flag","match_method","_merge",
     # Common main-votes columns (right). If they don't exist, they'll be ignored.
     "Ruolo_left","giocatore_left",	"Squadra_left",	"org", "ID",	 "giocatore_right",	"Ruolo_right", "Ruolo2",	
     "Squadra_right", "Min.Gioc.", "G", "CS", "TS", "Voto_Fantacalcio", "Voto_Statistico", "Voto_Italia",
-],
+    ],
 
     # Suggestions (display-only)
     "cutoff": 0.8,
@@ -82,7 +89,12 @@ DEFAULTS = {
     "auto_margin": 0.02,   # best must beat 2nd-best by this margin
 }
 
+# ------------------ Patterns ------------------
 POSSIBLE_PLAYER_COLS = ["giocatore", "nome", "player", "calciatore", "giocatori"]
+
+RE_MAIN   = re.compile(r"^VotiExcelUfficiali(\d{6})\.xlsx$", re.IGNORECASE)
+RE_EXTRA  = re.compile(r"^Voti_Fantacalcio_Stagione_.*_Giornata(\d{6})\.xlsx$", re.IGNORECASE)
+RE_ROSTER = re.compile(r"^fanta-26_(\d{6})\.xlsx$", re.IGNORECASE)
 
 # ------------------ Normalization ------------------
 _STOP_TOKENS = {"jr", "sr", "ii", "iii", "iv", "v"}
@@ -148,17 +160,11 @@ def _attach_merge_key(df: pd.DataFrame, use_initial_for: Set[str], raw_col: str,
     out = df.copy()
     out["__surname_token"]  = out[raw_col].map(_surname_token_from_raw)
     out["__first_initial"]  = out[raw_col].map(_first_initial_from_raw)
-
     if norm_col not in out.columns:
         out[norm_col] = out[raw_col].map(normalize_name)
-
     base = out[norm_col]
     with_initial = out["__surname_token"].fillna("") + "|" + out["__first_initial"].fillna("")
-    out["__merge_key"] = np.where(
-        out["__surname_token"].isin(use_initial_for),
-        with_initial,  # e.g., "kone|i"
-        base           # e.g., "angelino"
-    )
+    out["__merge_key"] = np.where(out["__surname_token"].isin(use_initial_for), with_initial, base)
     return out
 
 # ------------------ IO helpers ------------------
@@ -170,7 +176,6 @@ def detect_header_row(raw_df: pd.DataFrame) -> Optional[int]:
     return None
 
 def load_excel_with_player_column(path: Path, sheet: Optional[str] = None) -> pd.DataFrame:
-    # Try simple read
     try:
         df = pd.read_excel(path, sheet_name=sheet) if sheet else pd.read_excel(path)
         lowered = {str(c).strip().lower(): c for c in df.columns}
@@ -182,7 +187,6 @@ def load_excel_with_player_column(path: Path, sheet: Optional[str] = None) -> pd
             df["__row_id"] = df.index
             df["__giocatore_raw"] = df["giocatore"].astype(str)
             df["__giocatore_norm"] = df["__giocatore_raw"].map(normalize_name)
-            # Drop stray 'Nome'/'nome'
             if "Nome" in df.columns: df = df.drop(columns=["Nome"])
             if "nome" in df.columns: df = df.drop(columns=["nome"])
             return df
@@ -290,7 +294,7 @@ def load_extra_workbook(path: Path, sheets: Optional[List[str]]) -> List[pd.Data
         try:
             df = load_excel_with_player_column(path, sheet=sh)
         except Exception:
-            continue  # skip non-data sheets
+            continue
         slug = _slugify_sheet(sh)
         # Rename 'giocatore' -> 'giocatore_<slug>' to preserve raw per-sheet name
         df = df.rename(columns={"giocatore": f"giocatore_{slug}"})
@@ -307,10 +311,7 @@ def load_extra_workbook(path: Path, sheets: Optional[List[str]]) -> List[pd.Data
         results.append(df)
     return results
 
-# ------------------ Round-file discovery ------------------
-RE_MAIN  = re.compile(r"^VotiExcelUfficiali(\d{6})\.xlsx$", re.IGNORECASE)
-RE_EXTRA = re.compile(r"^Voti_Fantacalcio_Stagione_.*_Giornata(\d{6})\.xlsx$", re.IGNORECASE)
-
+# ------------------ Discovery ------------------
 def parse_round_from_code(code: str) -> Tuple[int, int]:
     season = int(code[:4])
     rnd = int(code[4:])
@@ -331,11 +332,28 @@ def discover_rounds(votes_dir: Path) -> Dict[str, Dict[str, Path]]:
             bucket['extra'] = p
     return rounds
 
+def discover_rosters(votes_dir: Path) -> Dict[str, Path]:
+    rosters: Dict[str, Path] = {}
+    for p in votes_dir.glob("*.xlsx"):
+        m = RE_ROSTER.match(p.name)
+        if m:
+            rosters[m.group(1)] = p
+    return rosters  # map: roster_code -> Path
+
+def select_roster_for_round(round_code: str, rosters: Dict[str, Path]) -> Optional[Path]:
+    """Pick the roster with max(code) <= round_code; if none, pick the min(code)."""
+    if not rosters:
+        return None
+    codes = sorted(rosters.keys())
+    eligible = [c for c in codes if c <= round_code]
+    chosen = eligible[-1] if eligible else codes[0]  # fallback to earliest if everything is > round_code
+    return rosters[chosen]
+
 # ------------------ CLI with defaults ------------------
 def parse_args_with_defaults():
     ap = argparse.ArgumentParser(description="Merge Fantacalcio votes across ALL rounds (directory scan) or one round.")
-    ap.add_argument("--votes-dir", type=Path, default=None, help="Directory containing per-round vote files (*.xlsx)")
-    ap.add_argument("left", nargs="?", default=None, type=Path, help="(Single-round mode) Path to left Excel file")
+    ap.add_argument("--votes-dir", type=Path, default=None, help="Directory containing roster + per-round vote files (*.xlsx)")
+    ap.add_argument("left", nargs="?", default=None, type=Path, help="(Single-round mode) Path to left roster Excel")
     ap.add_argument("right", nargs="?", default=None, type=Path, help="(Single-round mode) Path to main votes Excel")
     ap.add_argument("--left-sheet", type=str, default=None, help="Sheet name for the left file (optional)")
     ap.add_argument("--right-sheet", type=str, default=None, help="Sheet name for the right file (optional)")
@@ -378,25 +396,25 @@ def parse_args_with_defaults():
         drop_extra_only = False
     votes_dir = args.votes_dir or DEFAULTS["votes_dir"]
 
-    print("=== merge_fantacalcio_batch.py ===")
-    print(f"Votes dir:        {votes_dir if votes_dir else '(single-round mode)'}")
-    print(f"Left file:        {left}")
+    print("=== merge_fantarounds_auto_roster.py ===")
+    print(f"Votes dir (scan): {votes_dir if votes_dir else '(single-round mode)'}")
+    print(f"Default LEFT (single-round): {left}")
     if votes_dir is None:
-        print(f"Right file:       {right}")
-        print(f"Extra workbook:   {extra_workbook}")
+        print(f"RIGHT file:       {right}")
+        print(f"EXTRA workbook:   {extra_workbook}")
     print(f"Extra sheets:     {extra_sheets if extra_sheets else '(auto)'}")
     print(f"Extra join:       {extra_join} (drop_extra_only={drop_extra_only})")
     print(f"Output:           {output}")
-    print(f"Left sheet:       {left_sheet}")
+    print(f"LEFT sheet:       {left_sheet}")
     if votes_dir is None:
-        print(f"Right sheet:      {right_sheet}")
+        print(f"RIGHT sheet:      {right_sheet}")
     print(f"Suggest cutoff={cutoff}, max_suggestions={max_suggestions}")
     print(f"Auto fuzzy merge: {auto_fuzzy_merge} (cutoff={auto_cutoff}, margin={auto_margin})")
     print("============================")
 
-    if not Path(left).exists():
-        print(f"ERROR: Left file does not exist: {left}", file=sys.stderr); sys.exit(1)
-
+    # Only enforce LEFT existence in single-round mode
+    if votes_dir is None and not Path(left).exists():
+        print(f"ERROR: Left roster file does not exist: {left}", file=sys.stderr); sys.exit(1)
     if votes_dir is None:
         if not Path(right).exists():
             print(f"ERROR: Right file does not exist: {right}", file=sys.stderr); sys.exit(1)
@@ -411,16 +429,11 @@ def parse_args_with_defaults():
             auto_fuzzy_merge, auto_cutoff, auto_margin, extra_workbook, extra_sheets,
             extra_join, drop_extra_only, votes_dir)
 
-# ------------------ Per-round merge core ------------------
+# ------------------ Ambiguity set ------------------
 def _build_ambiguity_set(left_df: pd.DataFrame,
                          right_df: pd.DataFrame,
                          extra_dfs: List[pd.DataFrame]) -> Set[str]:
-    """
-    Find surnames that appear with >=2 different initials across LEFT+RIGHT+EXTRA.
-    Returns a set of surname tokens that must use 'surname|initial' as merge key.
-    """
     ser_list: List[pd.Series] = []
-
     if "__giocatore_raw" in left_df.columns:
         ser_list.append(left_df["__giocatore_raw"])
     if not right_df.empty and "__giocatore_raw" in right_df.columns:
@@ -429,21 +442,17 @@ def _build_ambiguity_set(left_df: pd.DataFrame,
         name_cols = [c for c in edf.columns if c.startswith("giocatore_")]
         if name_cols:
             ser_list.append(edf[name_cols[0]].astype(str))
-
     if not ser_list:
         return set()
-
     s_all = pd.concat(ser_list, ignore_index=True)
     tmp = pd.DataFrame({"_raw": s_all}).dropna()
-
     tmp["_surname"] = tmp["_raw"].map(_surname_token_from_raw)
     tmp["_init"]    = tmp["_raw"].map(_first_initial_from_raw)
-
     tmp = tmp.dropna(subset=["_surname", "_init"])
     ambiguous = tmp.groupby("_surname")["_init"].nunique(dropna=True)
-
     return set(ambiguous[ambiguous >= 2].index)
 
+# ------------------ Per-round merge core ------------------
 def merge_one_round(left_df: pd.DataFrame,
                     right_path: Optional[Path],
                     right_sheet: Optional[str],
@@ -545,6 +554,7 @@ def merge_one_round(left_df: pd.DataFrame,
 
     # -------- Join extra workbook sheets (if provided) --------
     coverage_rows = []
+    extra_dfs = load_extra_workbook(extra_workbook, sheets=extra_sheets) if (extra_workbook and Path(extra_workbook).exists()) else []
     if extra_dfs:
         for edf in extra_dfs:
             sheet_slug = [c.split("_", 1)[1] for c in edf.columns if c.startswith("giocatore_")]
@@ -586,7 +596,6 @@ def merge_one_round(left_df: pd.DataFrame,
     if stray:
         combined = combined.drop(columns=stray)
 
-    # Stats
     stats_counts = combined["match_flag"].value_counts(dropna=False).rename_axis("status").reset_index(name="count")
     method_counts = (combined.loc[combined["match_flag"] == "matched", "match_method"]
                      .value_counts(dropna=False).rename_axis("match_method").reset_index(name="count"))
@@ -599,18 +608,26 @@ def main():
     (left_path, left_sheet, right_path, right_sheet, output_path,
      cutoff, max_suggestions, auto_merge, auto_cutoff, auto_margin,
      extra_workbook, extra_sheets, extra_join, drop_extra_only, votes_dir) = parse_args_with_defaults()
+
     output_reduced = DEFAULTS.get("output_reduced")
     reduced_keep_cols = DEFAULTS.get("reduced_keep_cols", [])
-
-    # Load roster once
-    left_df = load_excel_with_player_column(left_path, sheet=left_sheet)
 
     # Batch mode?
     if votes_dir:
         rounds = discover_rounds(Path(votes_dir))
+        rosters = discover_rosters(Path(votes_dir))
+
         if not rounds:
             print(f"ERROR: No round files found in {votes_dir}. Expected names like VotiExcelUfficiali202501.xlsx", file=sys.stderr)
             sys.exit(1)
+        if not rosters and not (left_path and Path(left_path).exists()):
+            print(f"WARNING: No roster files (fanta-26_YYYYRR.xlsx) found in {votes_dir}. "
+                  f"Falling back to default LEFT: {left_path}", file=sys.stderr)
+            if not Path(left_path).exists():
+                print(f"ERROR: Default LEFT roster not found: {left_path}", file=sys.stderr); sys.exit(1)
+
+        # Cache loaded rosters to avoid re-reading
+        roster_cache: Dict[Path, pd.DataFrame] = {}
 
         all_rows = []
         all_stats = []
@@ -621,6 +638,13 @@ def main():
             season, rnd = parse_round_from_code(code)
             right = rounds[code].get("right")
             extra = rounds[code].get("extra")
+
+            roster_path = select_roster_for_round(code, rosters) if rosters else left_path
+            assert roster_path is not None
+            if roster_path not in roster_cache:
+                print(f"[roster] Loading {roster_path.name} for round {code}")
+                roster_cache[roster_path] = load_excel_with_player_column(roster_path, sheet=left_sheet)
+            left_df = roster_cache[roster_path]
 
             print(f"--- Processing round {code} (season={season}, round={rnd}) ---")
             combined, stats_counts, method_counts, coverage = merge_one_round(
@@ -640,10 +664,11 @@ def main():
             combined.insert(0, "season", season)
             combined.insert(1, "round", rnd)
             combined.insert(2, "round_code", code)
+            combined.insert(3, "roster_file", roster_path.name)
             all_rows.append(combined)
 
-            stats_counts = stats_counts.assign(season=season, round=rnd, round_code=code)
-            method_counts = method_counts.assign(season=season, round=rnd, round_code=code)
+            stats_counts = stats_counts.assign(season=season, round=rnd, round_code=code, roster_file=roster_path.name)
+            method_counts = method_counts.assign(season=season, round=rnd, round_code=code, roster_file=roster_path.name)
             coverage = coverage.assign(season=season, round=rnd, round_code=code)
             all_stats.append(stats_counts)
             all_methods.append(method_counts)
@@ -653,7 +678,7 @@ def main():
         round_stats = pd.concat(all_stats, ignore_index=True) if all_stats else pd.DataFrame()
         match_methods_by_round = pd.concat(all_methods, ignore_index=True) if all_methods else pd.DataFrame()
         coverage_by_round = pd.concat(all_coverage, ignore_index=True) if all_coverage else pd.DataFrame()
-        
+
         with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
             merged_all.to_excel(writer, index=False, sheet_name="merged_all")
             if not round_stats.empty:
@@ -663,12 +688,11 @@ def main():
             if not coverage_by_round.empty:
                 coverage_by_round.to_excel(writer, index=False, sheet_name="coverage_by_round")
         print(f"Done. Wrote: {output_path}")
-        # ---- also write a reduced file ----
 
+        # Also write reduced file
         if output_reduced:
             cols_exist = [c for c in reduced_keep_cols if c in merged_all.columns]
             if not cols_exist:
-                # fall back to a tiny safe set
                 cols_exist = [c for c in ["season","round","round_code","giocatore","__giocatore_norm","match_flag"] if c in merged_all.columns]
             reduced_df = merged_all[cols_exist].copy()
             output_reduced.parent.mkdir(parents=True, exist_ok=True)
@@ -676,29 +700,31 @@ def main():
                 reduced_df.to_excel(w, index=False, sheet_name="reduced")
             print(f"Also wrote reduced file: {output_reduced}  (rows={len(reduced_df):,}, cols={len(reduced_df.columns):,})")
 
-
         return
 
-    # Single-round fallback (legacy)
+    # Single-round fallback (legacy path)
     if right_path is not None and not Path(right_path).exists():
         print(f"ERROR: Right file does not exist: {right_path}", file=sys.stderr); sys.exit(1)
+    if not Path(left_path).exists():
+        print(f"ERROR: Left roster file does not exist: {left_path}", file=sys.stderr); sys.exit(1)
     if extra_workbook and not Path(extra_workbook).exists():
         print(f"WARNING: Extra workbook not found: {extra_workbook} (continuing without it)", file=sys.stderr)
         extra_workbook = None
 
+    left_df = load_excel_with_player_column(left_path, sheet=DEFAULTS["left_sheet"])
     combined, stats_counts, method_counts, coverage = merge_one_round(
         left_df=left_df,
         right_path=right_path,
         right_sheet=right_sheet,
         extra_workbook=extra_workbook,
-        extra_sheets=extra_sheets,
-        extra_join=extra_join,
-        drop_extra_only=drop_extra_only,
-        cutoff=cutoff,
-        max_suggestions=max_suggestions,
-        auto_merge=auto_merge,
-        auto_cutoff=auto_cutoff,
-        auto_margin=auto_margin,
+        extra_sheets=DEFAULTS["extra_sheets"],
+        extra_join=DEFAULTS["extra_join"],
+        drop_extra_only=DEFAULTS["drop_extra_only"],
+        cutoff=DEFAULTS["cutoff"],
+        max_suggestions=DEFAULTS["max_suggestions"],
+        auto_merge=DEFAULTS["auto_fuzzy_merge"],
+        auto_cutoff=DEFAULTS["auto_cutoff"],
+        auto_margin=DEFAULTS["auto_margin"],
     )
     with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
         combined.to_excel(writer, index=False, sheet_name="merged")
