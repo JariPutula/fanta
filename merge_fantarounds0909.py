@@ -73,7 +73,6 @@ DEFAULTS = {
     "reduced_keep_cols": [
         "season","round","round_code",
     "giocatore",
-    "match_flag","match_method","_merge",
     # Common main-votes columns (right). If they don't exist, they'll be ignored.
     "Ruolo_left","giocatore_left",	"Squadra_left",	"org", "ID",	 "giocatore_right",	"Ruolo_right", "Ruolo2",	
     "Squadra_right", "Min.Gioc.", "G", "CS", "TS", "Voto_Fantacalcio", "Voto_Statistico", "Voto_Italia",
